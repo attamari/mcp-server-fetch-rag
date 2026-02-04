@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import os
 from typing import Annotated
@@ -86,6 +87,15 @@ def reset_models() -> None:
     _embedding_model = None
     _sentence_splitter = None
     gc.collect()
+
+
+def _prefetch_models() -> None:
+    """Prefetch models in background on server startup."""
+    try:
+        get_embedding_model()
+        get_sentence_splitter()
+    except Exception:
+        pass
 
 
 def extract_content_from_html(html: str) -> str:
@@ -383,14 +393,14 @@ class FetchRag(BaseModel):
         str | None,
         Field(
             default=None,
-            description="Optional search query. If provided, returns chunks relevant to the query. If not provided, returns chunks with high centrality (representative of the document).",
+            description="Query to find relevant content",
         ),
     ]
     max_chunks: Annotated[
         int | None,
         Field(
             default=7,
-            description="Maximum number of chunks to return. If None, returns all chunks above min_score. Chunks are sorted by relevance score.",
+            description="Maximum number of chunks to return (default: 7)",
         ),
     ]
 
@@ -405,17 +415,14 @@ async def serve(
     user_agent_autonomous = custom_user_agent or DEFAULT_USER_AGENT_AUTONOMOUS
     user_agent_manual = custom_user_agent or DEFAULT_USER_AGENT_MANUAL
 
+    asyncio.create_task(asyncio.to_thread(_prefetch_models))
+
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         return [
             Tool(
                 name="fetch_rag",
-                description="""Fetches a URL and returns only the most relevant content.
-
-- With query: returns content matching the query
-- Without query: returns most representative content
-
-Use for focused retrieval instead of fetching entire pages.""",
+                description="Fetch URL and return relevant content. Optionally provide a query to find specific information.",
                 inputSchema=FetchRag.model_json_schema(),
             )
         ]
@@ -432,7 +439,7 @@ Use for focused retrieval instead of fetching entire pages.""",
                     ),
                     PromptArgument(
                         name="query",
-                        description="Optional search query for relevance filtering",
+                        description="Query to find relevant content",
                         required=False,
                     ),
                 ],
@@ -460,7 +467,7 @@ Use for focused retrieval instead of fetching entire pages.""",
         )
 
         if content.startswith("<error>"):
-            return [TextContent(type="text", text=f"{prefix}Contents of {url}:\n{content}")]
+            return [TextContent(type="text", text=f"{prefix}Content from {url}:\n{content}")]
 
         chunks = process_content_with_rag(
             content, args.query, MIN_SCORE, SIMILARITY_THRESHOLD, args.max_chunks
@@ -474,7 +481,7 @@ Use for focused retrieval instead of fetching entire pages.""",
                 )
             ]
 
-        result = f"Relevant content from {url}:\n\n"
+        result = f"{prefix}Content from {url}:\n\n"
         result += "\n\n---\n\n".join(chunks)
 
         return [TextContent(type="text", text=result)]

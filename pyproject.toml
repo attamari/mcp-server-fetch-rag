@@ -1,6 +1,6 @@
 [project]
 name = "mcp-server-fetch-rag"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Model Context Protocol server providing RAG-enhanced web fetching for LLMs"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -16,8 +16,9 @@ dependencies = [
     "wtpsplit-lite==0.2.0",
     "numpy==2.4.1",
     "pypdfium2==5.3.0",
-    # Windows: DirectML for GPU acceleration (AMD/Intel/NVIDIA via DirectX)
-    "onnxruntime-directml==1.23.0; sys_platform == 'win32'",
+    # Platform-specific ONNX Runtime with GPU acceleration
+    "onnxruntime-directml==1.23.0; sys_platform == 'win32'",  # Windows: DirectML (AMD/Intel/NVIDIA)
+    "onnxruntime-gpu==1.23.2; sys_platform == 'linux'",       # Linux: CUDA (fallback to CPU if no GPU)
 ]
 
 [project.optional-dependencies]
