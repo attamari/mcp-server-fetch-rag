@@ -102,7 +102,8 @@ def extract_content_from_html(html: str) -> str:
     """Extract and convert HTML content to Markdown format."""
     content = trafilatura.extract(
         html,
-        include_links=True,
+        include_links=False,
+        include_comments=False,
         include_formatting=True,
         include_tables=True,
         output_format="markdown",
