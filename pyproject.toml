@@ -1,6 +1,6 @@
 [project]
 name = "mcp-server-fetch-rag"
-version = "0.2.2"
+version = "0.3.0"
 description = "A Model Context Protocol server providing RAG-enhanced web fetching for LLMs"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

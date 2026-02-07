@@ -4,6 +4,7 @@ import os
 from typing import Annotated
 from urllib.parse import urlparse, urlunparse
 
+import httpx
 import numpy as np
 import onnxruntime as ort
 import pypdfium2 as pdfium
@@ -28,13 +29,27 @@ from pydantic import BaseModel, Field, AnyUrl
 from wtpsplit_lite import SaT
 
 # Constants
-DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
-DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
+DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/anthropics/mcp-fetch-rag)"
+DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/anthropics/mcp-fetch-rag)"
+DEFAULT_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Priority": "u=0, i",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 MIN_CHUNK_CHARS = 50
 MAX_CHUNK_CHARS = 3000
 SIMILARITY_THRESHOLD = 0.38
-MIN_SCORE = 0.38
+PERCENTILE_THRESHOLD = 30
+POWER_MEAN_P = 3.0
+LEXRANK_THRESHOLD = 0.1
+LEXRANK_DAMPING = 0.85
+LEXRANK_MAX_ITERATIONS = 100
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 _embedding_model: TextEmbedding | None = None
@@ -123,8 +138,9 @@ def extract_content_from_pdf(pdf_bytes: bytes) -> str:
         for page in pdf:
             textpage = page.get_textpage()
             text = textpage.get_text_range()
-            if text.strip():
-                text_parts.append(text.strip())
+            stripped = text.strip()
+            if stripped:
+                text_parts.append(stripped)
         pdf.close()
         if not text_parts:
             return "<error>No text content found in PDF</error>"
@@ -133,29 +149,24 @@ def extract_content_from_pdf(pdf_bytes: bytes) -> str:
         return f"<error>Failed to extract PDF content: {e!r}</error>"
 
 
-def get_robots_txt_url(url: str) -> str:
-    """Get the robots.txt URL for a given website URL."""
-    parsed = urlparse(url)
-    robots_url = urlunparse((parsed.scheme, parsed.netloc, "/robots.txt", "", "", ""))
-    return robots_url
-
-
 async def check_may_autonomously_fetch_url(
     url: str, user_agent: str, proxy_url: str | None = None
 ) -> None:
     """Check if the URL can be fetched according to robots.txt."""
-    from httpx import AsyncClient, HTTPError
+    parsed = urlparse(url)
+    robot_txt_url = urlunparse(
+        (parsed.scheme, parsed.netloc, "/robots.txt", "", "", "")
+    )
 
-    robot_txt_url = get_robots_txt_url(url)
-
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with httpx.AsyncClient(proxy=proxy_url) as client:
         try:
             response = await client.get(
                 robot_txt_url,
                 follow_redirects=True,
-                headers={"User-Agent": user_agent},
+                headers={"User-Agent": user_agent, **DEFAULT_HEADERS},
+                timeout=30,
             )
-        except HTTPError:
+        except httpx.HTTPError:
             raise McpError(
                 ErrorData(
                     code=INTERNAL_ERROR,
@@ -173,10 +184,7 @@ async def check_may_autonomously_fetch_url(
             return
         robot_txt = response.text
 
-    processed_robot_txt = "\n".join(
-        line for line in robot_txt.splitlines() if not line.strip().startswith("#")
-    )
-    robot_parser = Protego.parse(processed_robot_txt)
+    robot_parser = Protego.parse(robot_txt)
     if not robot_parser.can_fetch(str(url), user_agent):
         raise McpError(
             ErrorData(
@@ -190,17 +198,15 @@ async def fetch_url(
     url: str, user_agent: str, proxy_url: str | None = None
 ) -> tuple[str, str]:
     """Fetch the URL and return the content."""
-    from httpx import AsyncClient, HTTPError
-
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with httpx.AsyncClient(proxy=proxy_url) as client:
         try:
             response = await client.get(
                 url,
                 follow_redirects=True,
-                headers={"User-Agent": user_agent},
+                headers={"User-Agent": user_agent, **DEFAULT_HEADERS},
                 timeout=30,
             )
-        except HTTPError as e:
+        except httpx.HTTPError as e:
             raise McpError(
                 ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}")
             )
@@ -235,107 +241,128 @@ def split_sentences(text: str) -> list[str]:
     """Split text into sentences using wtpsplit."""
     splitter = get_sentence_splitter()
     sentences = splitter.split(text)
-    return [s.strip() for s in sentences if s.strip()]
+    stripped = [s.strip() for s in sentences]
+    return [s for s in stripped if s]
 
 
-def embed_texts(texts: list[str], is_query: bool = False) -> np.ndarray:
+def embed_texts(texts: list[str]) -> np.ndarray:
     """Embed texts using the configured embedding model."""
     model = get_embedding_model()
-
-    # E5 models require "query:" / "passage:" prefixes
-    if "e5" in EMBEDDING_MODEL.lower():
-        prefix = "query: " if is_query else "passage: "
-        texts = [prefix + t for t in texts]
-
-    embeddings = list(model.embed(texts))
-    return np.array(embeddings)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Compute cosine similarity between vectors."""
-    if a.ndim == 1:
-        a = a.reshape(1, -1)
-    if b.ndim == 1:
-        b = b.reshape(1, -1)
-
-    a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)
-    b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
-
-    return np.dot(a_norm, b_norm.T)
+    result = np.array(list(model.embed(texts)))
+    norms = np.linalg.norm(result, axis=1, keepdims=True)
+    result /= norms
+    return result
 
 
 def semantic_chunking(
     sentences: list[str],
     embeddings: np.ndarray,
-    threshold: float = SIMILARITY_THRESHOLD,
-) -> tuple[list[str], np.ndarray]:
+) -> tuple[list[str], list[list[int]]]:
     """Perform semantic chunking based on sentence similarity."""
-    if len(sentences) == 0:
-        return [], np.array([])
+    if not sentences:
+        return [], []
 
     if len(sentences) == 1:
-        return sentences, embeddings
+        return sentences, [[0]]
+
+    adj_similarities = np.sum(embeddings[:-1] * embeddings[1:], axis=1)
 
     chunks = []
-    chunk_embeddings = []
+    chunk_sentence_indices = []
     current_chunk_sentences = [sentences[0]]
     current_chunk_indices = [0]
+    current_chunk_len = len(sentences[0])
 
     for i in range(1, len(sentences)):
-        sim = cosine_similarity(embeddings[i - 1], embeddings[i])[0, 0]
-        current_chunk_text = " ".join(current_chunk_sentences)
+        sim = adj_similarities[i - 1]
+        next_len = len(sentences[i])
 
-        should_split = sim < threshold
-        if len(current_chunk_text) + len(sentences[i]) > MAX_CHUNK_CHARS:
+        should_split = sim < SIMILARITY_THRESHOLD
+        if current_chunk_len + next_len > MAX_CHUNK_CHARS:
             should_split = True
 
-        if should_split and len(current_chunk_text) >= MIN_CHUNK_CHARS:
-            chunks.append(current_chunk_text)
-            chunk_emb = embeddings[current_chunk_indices].mean(axis=0)
-            chunk_embeddings.append(chunk_emb)
+        if should_split and current_chunk_len >= MIN_CHUNK_CHARS:
+            chunks.append(" ".join(current_chunk_sentences))
+            chunk_sentence_indices.append(current_chunk_indices.copy())
 
             current_chunk_sentences = [sentences[i]]
             current_chunk_indices = [i]
+            current_chunk_len = next_len
         else:
             current_chunk_sentences.append(sentences[i])
             current_chunk_indices.append(i)
+            current_chunk_len += 1 + next_len
 
     if current_chunk_sentences:
-        current_chunk_text = " ".join(current_chunk_sentences)
-        chunks.append(current_chunk_text)
-        chunk_emb = embeddings[current_chunk_indices].mean(axis=0)
-        chunk_embeddings.append(chunk_emb)
+        chunks.append(" ".join(current_chunk_sentences))
+        chunk_sentence_indices.append(current_chunk_indices)
 
-    return chunks, np.array(chunk_embeddings)
+    return chunks, chunk_sentence_indices
 
 
-def calculate_centrality_scores(chunk_embeddings: np.ndarray) -> np.ndarray:
-    """Calculate centrality scores (similarity to document centroid)."""
-    if len(chunk_embeddings) == 0:
+def aggregate_power_mean_chunks(
+    scores: np.ndarray,
+    chunk_sentence_indices: list[list[int]],
+) -> np.ndarray:
+    """Vectorized power mean aggregation over contiguous chunk groups."""
+    if not chunk_sentence_indices:
         return np.array([])
+    starts = np.array([indices[0] for indices in chunk_sentence_indices])
+    lengths = np.array([len(indices) for indices in chunk_sentence_indices])
+    powered = np.power(np.maximum(scores, 0.0), POWER_MEAN_P)
+    sums = np.add.reduceat(powered, starts)
+    return np.power(sums / lengths, 1.0 / POWER_MEAN_P)
 
-    centroid = chunk_embeddings.mean(axis=0)
-    scores = cosine_similarity(centroid, chunk_embeddings)[0]
-    return scores
+
+def calculate_lexrank_scores(
+    sentence_embeddings: np.ndarray,
+    chunk_sentence_indices: list[list[int]],
+) -> np.ndarray:
+    """Calculate LexRank scores at sentence level, then aggregate to chunk level."""
+    if len(chunk_sentence_indices) == 0:
+        return np.array([])
+    n_sentences = len(sentence_embeddings)
+    if n_sentences == 0:
+        return np.array([])
+    if n_sentences == 1:
+        return np.array([1.0])
+    similarity_matrix = sentence_embeddings @ sentence_embeddings.T
+    np.fill_diagonal(similarity_matrix, 0)
+    similarity_matrix[similarity_matrix < LEXRANK_THRESHOLD] = 0
+    row_sums = similarity_matrix.sum(axis=1, keepdims=True)
+    transition_matrix = np.where(
+        row_sums > 0,
+        similarity_matrix / row_sums,
+        1.0 / n_sentences,
+    )
+    sentence_scores = np.ones(n_sentences) / n_sentences
+    for _ in range(LEXRANK_MAX_ITERATIONS):
+        prev_scores = sentence_scores.copy()
+        sentence_scores = (
+            (1 - LEXRANK_DAMPING) / n_sentences
+            + LEXRANK_DAMPING * transition_matrix.T @ sentence_scores
+        )
+        if np.allclose(sentence_scores, prev_scores, atol=1e-6):
+            break
+    return aggregate_power_mean_chunks(sentence_scores, chunk_sentence_indices)
 
 
 def calculate_query_scores(
-    query: str, chunk_embeddings: np.ndarray
+    query: str,
+    sentence_embeddings: np.ndarray,
+    chunk_sentence_indices: list[list[int]],
 ) -> np.ndarray:
-    """Calculate similarity scores between query and chunks."""
-    if len(chunk_embeddings) == 0:
+    """Calculate similarity scores using late interaction (power mean of sentence scores)."""
+    if len(chunk_sentence_indices) == 0:
         return np.array([])
-
-    query_embedding = embed_texts([query], is_query=True)[0]
-    scores = cosine_similarity(query_embedding, chunk_embeddings)[0]
-    return scores
+    query_embedding = embed_texts([query])[0]
+    all_scores = query_embedding @ sentence_embeddings.T
+    return aggregate_power_mean_chunks(all_scores, chunk_sentence_indices)
 
 
 def process_content_with_rag(
     content: str,
     query: str | None,
-    min_score: float,
-    similarity_threshold: float,
     max_chunks: int | None = None,
 ) -> list[str]:
     """Process content with RAG: split, embed, chunk, score, filter, and limit."""
@@ -344,33 +371,47 @@ def process_content_with_rag(
         if not sentences:
             return []
 
-        sentence_embeddings = embed_texts(sentences, is_query=False)
-        chunks, chunk_embeddings = semantic_chunking(sentences, sentence_embeddings, similarity_threshold)
-        del sentence_embeddings
+        sentence_embeddings = embed_texts(sentences)
+        chunks, chunk_sentence_indices = semantic_chunking(
+            sentences, sentence_embeddings
+        )
 
         if not chunks:
             return []
 
         if query:
-            scores = calculate_query_scores(query, chunk_embeddings)
+            scores = calculate_query_scores(
+                query, sentence_embeddings, chunk_sentence_indices
+            )
+            lexrank_scores = None
         else:
-            scores = calculate_centrality_scores(chunk_embeddings)
+            lexrank_scores = calculate_lexrank_scores(
+                sentence_embeddings, chunk_sentence_indices
+            )
+            scores = lexrank_scores
+
+        threshold = max(float(np.percentile(scores, PERCENTILE_THRESHOLD)), 0.0)
 
         scored_chunks = [
             (i, chunk, score)
             for i, (chunk, score) in enumerate(zip(chunks, scores))
-            if score >= min_score
+            if score >= threshold
         ]
+        passed_indices = {i for i, _, _ in scored_chunks}
 
-        # Supplement with centrality-based chunks if needed
         effective_max = max_chunks if max_chunks is not None else len(chunks)
-        if len(scored_chunks) < effective_max:
-            centrality_scores = calculate_centrality_scores(chunk_embeddings)
-            included_indices = {i for i, _, _ in scored_chunks}
+        if len(scored_chunks) < effective_max and query:
+            if lexrank_scores is None:
+                lexrank_scores = calculate_lexrank_scores(
+                    sentence_embeddings, chunk_sentence_indices
+                )
+            lr_threshold = max(
+                float(np.percentile(lexrank_scores, PERCENTILE_THRESHOLD)), 0.0
+            )
             remaining_chunks = [
-                (i, chunk, centrality_scores[i])
+                (i, chunk, lexrank_scores[i])
                 for i, chunk in enumerate(chunks)
-                if i not in included_indices
+                if i not in passed_indices and lexrank_scores[i] >= lr_threshold
             ]
             remaining_chunks.sort(key=lambda x: x[2], reverse=True)
             needed = effective_max - len(scored_chunks)
@@ -381,9 +422,38 @@ def process_content_with_rag(
             scored_chunks = scored_chunks[:max_chunks]
 
         scored_chunks.sort(key=lambda x: x[0])
+
         return [chunk for _, chunk, _ in scored_chunks]
     finally:
         reset_models()
+
+
+async def _run_fetch_pipeline(
+    url: str,
+    query: str | None,
+    user_agent: str,
+    proxy_url: str | None,
+    check_robots: bool,
+    max_chunks: int | None = None,
+) -> str:
+    """Fetch URL, run RAG pipeline, return formatted text."""
+    if check_robots:
+        await check_may_autonomously_fetch_url(url, user_agent, proxy_url)
+
+    content, prefix = await fetch_url(url, user_agent, proxy_url=proxy_url)
+
+    if content.startswith("<error>"):
+        return f"{prefix}Content from {url}:\n{content}"
+
+    chunks = process_content_with_rag(content, query, max_chunks)
+
+    if not chunks:
+        msg = f"No relevant content found for {url}"
+        if query:
+            msg += f" with query '{query}'"
+        return msg
+
+    return f"{prefix}Content from {url}:\n\n" + "\n\n---\n\n".join(chunks)
 
 
 class FetchRag(BaseModel):
@@ -398,10 +468,10 @@ class FetchRag(BaseModel):
         ),
     ]
     max_chunks: Annotated[
-        int | None,
+        int,
         Field(
-            default=7,
-            description="Maximum number of chunks to return (default: 7)",
+            default=10,
+            description="Maximum number of chunks to return (default: 10)",
         ),
     ]
 
@@ -453,73 +523,44 @@ async def serve(
             args = FetchRag(**arguments)
         except ValueError as e:
             raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
-
         url = str(args.url)
-        if not url:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
-
-        if not ignore_robots_txt:
-            await check_may_autonomously_fetch_url(
-                url, user_agent_autonomous, proxy_url
+        try:
+            text = await _run_fetch_pipeline(
+                url,
+                args.query,
+                user_agent_autonomous,
+                proxy_url,
+                check_robots=not ignore_robots_txt,
+                max_chunks=args.max_chunks,
             )
-
-        content, prefix = await fetch_url(
-            url, user_agent_autonomous, proxy_url=proxy_url
-        )
-
-        if content.startswith("<error>"):
-            return [TextContent(type="text", text=f"{prefix}Content from {url}:\n{content}")]
-
-        chunks = process_content_with_rag(
-            content, args.query, MIN_SCORE, SIMILARITY_THRESHOLD, args.max_chunks
-        )
-
-        if not chunks:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"No relevant content found for {url}" + (f" with query '{args.query}'" if args.query else ""),
-                )
-            ]
-
-        result = f"{prefix}Content from {url}:\n\n"
-        result += "\n\n---\n\n".join(chunks)
-
-        return [TextContent(type="text", text=result)]
+        except McpError as e:
+            text = str(e)
+        except Exception as e:
+            text = f"Failed to process content from {url}: {e!r}"
+        return [TextContent(type="text", text=text)]
 
     @server.get_prompt()
     async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
         if not arguments or "url" not in arguments:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
-
+            raise McpError(
+                ErrorData(code=INVALID_PARAMS, message="URL is required")
+            )
         url = arguments["url"]
         query = arguments.get("query")
-
         try:
-            content, prefix = await fetch_url(url, user_agent_manual, proxy_url=proxy_url)
-        except McpError as e:
-            return GetPromptResult(
-                description=f"Failed to fetch {url}",
-                messages=[
-                    PromptMessage(
-                        role="user",
-                        content=TextContent(type="text", text=str(e)),
-                    )
-                ],
+            text = await _run_fetch_pipeline(
+                url, query, user_agent_manual, proxy_url, check_robots=False
             )
-
-        chunks = process_content_with_rag(content, query, MIN_SCORE, SIMILARITY_THRESHOLD)
-
-        if not chunks:
-            result = f"No relevant content found for {url}"
-        else:
-            result = f"Relevant content from {url}:\n\n"
-            result += "\n\n---\n\n".join(chunks)
-
+        except McpError as e:
+            text = str(e)
+        except Exception as e:
+            text = f"Failed to process content from {url}: {e!r}"
         return GetPromptResult(
-            description=f"Relevant content from {url}",
+            description=f"Content from {url}",
             messages=[
-                PromptMessage(role="user", content=TextContent(type="text", text=result))
+                PromptMessage(
+                    role="user", content=TextContent(type="text", text=text)
+                )
             ],
         )
 
